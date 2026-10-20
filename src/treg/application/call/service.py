@@ -17,6 +17,7 @@ from ...application import hub as hub_app
 from ...application.hub import runner as hub_runner
 from ...application.hub import limits as hub_limits
 from ... import sandbox as demo_sandbox
+from ...capacity_notice import CAPACITY_HEADER, EXHAUSTED
 from ...client_identity import _norm_client
 from ...config import get_settings
 from ...domain.catalog import results as catalog_results
@@ -199,12 +200,13 @@ async def _finish_cancelled_call(
     response: UpstreamResponse | None = None,
     *,
     trusted_org_id: int | None = None,
+    sent: bool = False,
 ) -> None:
     claim, request.state.idem_claim = request.state.idem_claim, None
     if mk is not None and mk.metered:
         request.context.finalization = FinalizationState.FINALIZING
     await finish_cancelled_call(
-        claim, mk, call_ref, response, trusted_org_id=trusted_org_id)
+        claim, mk, call_ref, response, trusted_org_id=trusted_org_id, sent=sent)
 
 
 async def _await_before_reserve(awaitable, request: _ApplicationRequest, call_ref: str):
@@ -1234,6 +1236,7 @@ async def _execute_call(request: _ApplicationRequest, upstream_client: httpx.Asy
             raise
     body = b""
     response: UpstreamResponse | None = None
+    sent = False   # the request left for the provider: a cancel from here on may follow its effect
     started = _now_ms()
     try:
         # treg keeps oauth tokens fresh: refresh in place if stale, before injecting. Inside the
@@ -1379,6 +1382,7 @@ async def _execute_call(request: _ApplicationRequest, upstream_client: httpx.Asy
                     if share_slot.waited_ms:
                         smoothed.append(f"share_wait={share_slot.waited_ms}")
                 upstream_started = _now_ms()
+                sent = True
                 response = await relay(
                     upstream_request,
                     upstream_url, tool, secrets, upstream_client,
@@ -1510,7 +1514,7 @@ async def _execute_call(request: _ApplicationRequest, upstream_client: httpx.Asy
         finally:
             share_slot.release()
     except asyncio.CancelledError:
-        await _finish_cancelled_call(request, mk, call_ref, response)
+        await _finish_cancelled_call(request, mk, call_ref, response, sent=sent)
         raise
     except CallFailure as exc:
         # The provider never produced a billable answer (our own error, a failed injection, an
@@ -1781,6 +1785,10 @@ async def _execute_call(request: _ApplicationRequest, upstream_client: httpx.Asy
             # DataForSEO task status other than 20000). The body is relayed untouched and the
             # charge is what the provider reported; this header is how the caller learns it.
             _set_response_header(response, "X-Treg-Upstream-Failed", upstream_failed)
+        if not served_via and capacity_signal in capacity_signatures.EXHAUSTING_KINDS:
+            # treg's own account is out. The body stays the provider's; this header lets every
+            # surface tell the caller it is not their balance and not theirs to fix.
+            _set_response_header(response, CAPACITY_HEADER, EXHAUSTED)
         if smoothed:
             _set_response_header(response, "X-Treg-Smoothed", " ".join(smoothed))
         return response

@@ -11,12 +11,6 @@ and SERP, backlinks, social and trends, enrichment, ads, scraping, image and vid
 know which vendor sells backlink data, or to hold an account with them. Search the catalog for what
 you want to do, read the price, call it.
 
-Three readable indexes, each also served as Markdown by appending `.md`: `{BASE}/use-cases`
-(one page per job, every provider that does it compared on price, measured success rate and
-speed), `{BASE}/workflows` (several jobs chained into one prompt, each step priced, with the
-receipt from a real run) and `{BASE}/tools/<provider>` (one provider's endpoints and per-call
-prices). Start there when you want the comparison rather than one endpoint.
-
 Why this exists: the tools an agent needs for real work are behind subscriptions nobody buys for a
 single run (Semrush $139/mo, Moz $99/mo, Crunchbase $99/mo, Apollo $59/seat), behind signup walls,
 or behind no public API at all — invite-only, partner-only, app-review-only. treg carries those
@@ -414,10 +408,14 @@ Money notes for agents:
   so metered calls lose the repeat price. An idempotency replay is different
   (`X-Treg-Idempotent-Replay: true`). Empty results are the provider's own semantics — treg does
   not normalise "no data" vs "no coverage" vs "unsupported target".
-- Out of balance → HTTP **402** with a machine-actionable body: `balance_micro`,
+- Out of balance → HTTP **402** `error: insufficient_balance` with a machine-actionable body: `balance_micro`,
   `estimated_cost_micro`, `topup_url`. Recovery: `treg balance` (ledger), top up in the
   dashboard (Team → Billing), or connect the org's own key for that provider - own keys
   are never billed to the balance.
+- `X-Treg-Capacity: exhausted` on a relayed answer → treg's OWN account for that tool just
+  refused for want of credit (any status; the body is the provider's). Not your balance; nothing
+  charged when `X-Treg-Cost-Micro` is `0`. Over MCP: `whose_error: treg`, no body, and a hint.
+  Try another tool meanwhile; treg is notified.
 - HTTP **503** with `error: provider_capacity_unavailable` → treg's OWN account for that
   provider is out right now (not your balance, nothing charged). The body names `resets_at`
   when known and `alternatives` — other providers for the same capability; pick one, or use
@@ -639,9 +637,10 @@ All need a credential, and the challenge comes EARLY: every id-bearing JSON-RPC 
 authorize, and challenging the first request is what makes it run OAuth before the session proceeds
 rather than reporting a connected server whose every tool then fails.
 
-Only notifications (no id, no response expected) and `ping` pass without a credential. The
-`.well-known/*` documents are ordinary GET routes and stay open, which is the discovery a client
-actually needs.
+Only notifications (no id, no response expected) and `ping` pass without a credential. A GET (or
+any other non-POST) on the MCP URL gets the same 401 without a credential, and 405 with one: there
+is no server-initiated stream. The `.well-known/*` documents are ordinary GET routes and stay open,
+which is the discovery a client actually needs.
 
 An access token that is expired, forged, or minted for another resource gets a 401 carrying
 `error="invalid_token"`. That is the cue an OAuth client uses to run its refresh grant silently, so a
@@ -829,7 +828,8 @@ skills` restrict it (`--dir` sets the location).
      request `treg` ONCE and work straight through; do not stop between steps. The flow:
      install (`curl -fsSL {BASE}/install.sh | sh`), sign in (`treg login`, or
      `treg login --token <token>` + `treg org use <team>` if they gave you one), then verify
-     quietly: `treg balance` and one `treg catalog search`.
+     quietly: bare `treg` (account, team, balance, own tools and next commands in one call) and
+     one `treg catalog search`.
    - **Sandboxed agent** (cloud container, restricted egress): try the installer. If `{BASE}`
      is unreachable — a proxy `403` on `CONNECT`, a DNS failure, or a timeout — you are behind
      an egress allowlist. Do not retry and do not try alternate hosts. Tell the human that

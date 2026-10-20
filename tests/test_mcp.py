@@ -405,6 +405,9 @@ async def test_one_team_cannot_read_another_teams_tools(clients):
     assert names_a, f"org A saw no tools at all — the assertion below would pass for free: {seen_a}"
     assert "a-only-tool" in names_a
     assert "a-only-tool" not in names_b, f"org B saw org A's tool: {seen_b}"
+    # Each team also learns its own label for shared provider accounts, and only its own.
+    assert seen_a.get("team_label", "").startswith("team-") and seen_b.get("team_label", "").startswith("team-")
+    assert seen_a["team_label"] != seen_b["team_label"]
 
 
 async def test_call_refuses_an_endpoint_that_does_not_exist(clients):
@@ -729,6 +732,36 @@ async def test_a_notification_and_ping_pass_without_a_token(clients):
         r = await c.post("http://localhost/mcp/", headers=MCP_HEADERS,
                          json={"jsonrpc": "2.0", "id": 1, "method": "ping"})
         assert r.status_code == 200, r.text
+
+
+async def test_a_non_POST_is_challenged_like_a_POST_then_refused_not_streamed(clients):
+    """Issue #1064: a GET probe used to open an SSE stream that never answered."""
+    from treg.domain.identity import mcp_oauth
+    dead = mcp_oauth.make_access_token(user_id=7, org_id=3, audience=mcp_oauth.mcp_resource_url(),
+                                       scope="treg:call", ttl=-60)
+    live = mcp_oauth.make_access_token(user_id=7, org_id=3, audience=mcp_oauth.mcp_resource_url(),
+                                       scope="treg:call")
+    sse = {"Accept": "text/event-stream"}
+    async with mcp_session(clients) as c:
+        missing = await c.get("http://localhost/mcp/", headers=sse)
+        expired = await c.get("http://localhost/mcp/",
+                              headers={**sse, "Authorization": f"Bearer {dead}"})
+        credentialed = [await c.get("http://localhost/mcp/",
+                                    headers={**sse, "Authorization": f"Bearer {token}"})
+                        for token in (live, "treg_per_org_token")]
+        delete = await c.delete("http://localhost/mcp/")
+        head = await c.head("http://localhost/mcp/", headers={"Authorization": f"Bearer {live}"})
+    assert missing.status_code == 401, missing.text
+    assert "resource_metadata=" in missing.headers["www-authenticate"]
+    assert 'error="invalid_token"' not in missing.headers["www-authenticate"]
+    assert expired.status_code == 401, expired.text
+    assert 'error="invalid_token"' in expired.headers["www-authenticate"]
+    for r in credentialed:
+        assert r.status_code == 405, r.text
+        assert r.headers["allow"] == "POST"
+        assert r.headers["content-type"] == "application/json"
+    assert delete.status_code == 401
+    assert head.status_code == 405 and head.headers["allow"] == "POST"
 
 
 async def test_auth_body_replay_waits_for_the_real_disconnect_on_a_long_response() -> None:
@@ -1618,3 +1651,19 @@ async def test_a_lone_surrogate_in_an_upstream_body_still_returns_the_paid_answe
     assert out["status"] == 200
     assert out["body"] == {"elements": [{"content": "\U0001d401old � cut"}]}
     assert out["call_id"] and out["cost_usd"] > 0
+
+
+async def test_catalog_get_gives_the_caller_its_own_team_values(clients, monkeypatch):
+    """MCP catalog_get on a row with team_label fields returns `your_values` for the calling team,
+    and names that team on the internal read, so a person in several teams still gets them."""
+    from treg.application.call import resolve as call_resolution
+    from treg.domain.catalog import store as catalog_store
+    cat = catalog_store.load()
+    ep = dict(cat.by_id["crawl4ai.watch.list"])
+    monkeypatch.setitem(cat.by_id, "crawl4ai.watch.list", ep)
+    token = (await clients.post("/users", json={"email": "watcher@superdesign.dev"})).json()["token"]
+    clients.headers["X-Treg-Token"] = token
+    org_id = (await clients.get("/orgs")).json()[0]["org_id"]
+    async with mcp_session(clients) as c:
+        out = await _call_tool(c, "catalog_get", {"endpoint_id": "crawl4ai.watch.list"}, token=token)
+    assert out["endpoint"]["your_values"] == {"queryParams.agent": call_resolution.team_label(org_id)}

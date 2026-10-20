@@ -55,12 +55,14 @@ from mcp.server.mcpserver import Context
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.shared.exceptions import MCPError
 from mcp.types import AudioContent, CallToolResult, METHOD_NOT_FOUND, TextContent, ToolAnnotations
+from starlette.responses import JSONResponse
 
 from . import analytics, audit, client_ip, hints, jsontext, oauth_providers
 from .application import catalog_find as find_app
 from .application import catalog_search as search_app
 from .application import search_experiment
 from .domain.catalog import store as catalog_store
+from .capacity_notice import account_out_notice, is_balance_refusal
 from .config import get_settings
 from .feedback_contract import FeedbackCategory, FEEDBACK_DESCRIPTION, ReviewUsefulness, REVIEW_DESCRIPTION
 from .domain.catalog.stats import EndpointObservationReader
@@ -504,6 +506,7 @@ class TeamTool(TypedDict, total=False):
 
 class MyToolsOut(TypedDict, total=False):
     team: str | None
+    team_label: str | None   # the team's label on shared provider accounts (Watch's `agent`), for tools with team_label fields
     team_name: str | None
     identity: str | None
     count: int | None
@@ -1222,7 +1225,14 @@ async def _catalog_get_impl(
     api_context = (_api(token) if surface is _TEAM_SURFACE
                    else _api(token, client_name=surface.client_name))
     async with api_context as client:
-        r = await client.get(f"/catalog/endpoints/{endpoint_id}")
+        headers = {}
+        if token and ep is not None and (ep.get("team_label") or ep.get("caller_email")):
+            # Name the team, so a person signed in to several teams still gets its own values
+            # (`your_values`): an identity token alone does not say which team is asking.
+            _, slug, problem = await _resolve_org(client)
+            if slug and not problem:
+                headers["X-Treg-Org"] = slug
+        r = await client.get(f"/catalog/endpoints/{endpoint_id}", headers=headers)
     if r.status_code == 404:
         cat = catalog_store.load()
         return {"error": f"unknown endpoint {endpoint_id!r}",
@@ -1583,7 +1593,17 @@ async def _call_impl(endpoint_id: str, params: dict | list | None = None,
         out["suggestion"] = (f"{routed} does this job: treg picks the provider, falls back when one "
                              "fails or misses, and charges only the answer. Prefer it next time unless "
                              "you need options only this provider has.")
-    if r.status_code == 402:
+    if r.status_code >= 400:
+        # Whose fault it was matters to an agent deciding whether to retry elsewhere.
+        out["whose_error"] = "treg" if r.headers.get("X-Treg-Error") else "provider"
+    if notice := account_out_notice(r.headers):
+        # treg's own account for this tool is out: not the caller's balance, not theirs to fix. The
+        # provider's words would name its wallet and top-up page, so they are left out; the call id
+        # stays for support.
+        out.pop("body", None)
+        out["whose_error"] = "treg"
+        out["hint"] = notice
+    elif r.status_code == 402:
         # States the fact and stops. No link, and `topup_url` is stripped from the relayed body, so
         # nothing on this path points a user at a payment page.
         #
@@ -1596,11 +1616,8 @@ async def _call_impl(endpoint_id: str, params: dict | list | None = None,
         # Scoped to the MCP path deliberately. `/call/`'s 402 still carries `topup_url` for the CLI
         # and the dashboard, where no such policy applies and the shortcut is genuinely useful.
         out["body"] = _without_purchase_pointers(out.get("body"))
-        if not out.get("replayed"):
+        if is_balance_refusal(r.headers, out.get("body")):
             out["hint"] = "the team's prepaid balance is not enough for this call"
-    elif r.status_code >= 400:
-        # Whose fault it was matters to an agent deciding whether to retry elsewhere.
-        out["whose_error"] = "treg" if r.headers.get("X-Treg-Error") else "provider"
     return out
 
 
@@ -1773,7 +1790,7 @@ async def my_tools(ctx: Context) -> MyToolsOut:
     if not token:
         return _need_token()
     async with _api(token) as client:
-        _, slug, problem = await _resolve_org(client)
+        org_id, slug, problem = await _resolve_org(client)
         if problem:
             return problem
         r = await client.get("/tools", headers={"X-Treg-Org": slug or ""})
@@ -1782,8 +1799,10 @@ async def my_tools(ctx: Context) -> MyToolsOut:
     if r.status_code != 200:
         return {"error": "could not list the team's tools", "detail": body}
     tools = body if isinstance(body, list) else body.get("tools", [])
+    from .application.call.resolve import team_label
     return {
         **whose,
+        **({"team_label": team_label(org_id)} if org_id is not None else {}),
         "count": len(tools),
         "tools": [{"name": t.get("name"), "base_url": t.get("base_url"),
                    "description": t.get("description")} for t in tools],
@@ -2076,7 +2095,8 @@ class RequireAuthForProtectedTools:
     handshake) so OAuth runs before the session proceeds — which is what Stripe/Subframe/AuthKit MCP
     servers do, and what makes a client show "needs authentication" and prompt, rather than "Connected"
     with silent 200s on a server nothing works against. Only notifications and `ping` pass without a
-    credential (see `_auth_verdict`); `.well-known/*` discovery is separate GET routes, untouched.
+    credential (see `_auth_verdict`); any other HTTP method is challenged the same way, then
+    refused with 405 (`_refuse_non_post`). `.well-known/*` discovery is separate GET routes.
 
     Sits in front of the transport rather than inside it: this is an HTTP concern, and the SDK owns
     everything below.
@@ -2087,8 +2107,10 @@ class RequireAuthForProtectedTools:
         self.resource_version = resource_version
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or scope.get("method") != "POST":
+        if scope["type"] != "http":
             return await self.app(scope, receive, send)
+        if scope.get("method") != "POST":
+            return await self._refuse_non_post(scope, receive, send)
 
         chunks: list[bytes] = []
         consumed_messages = []
@@ -2109,7 +2131,7 @@ class RequireAuthForProtectedTools:
         # the exact request/disconnect sequence instead.
         verdict = self._auth_verdict(scope, body) if body_complete else None
         if verdict is not None:
-            return await self._challenge(send, invalid=(verdict == "invalid"))
+            return await self._challenge(scope, receive, send, invalid=(verdict == "invalid"))
 
         # The body was consumed to inspect it, so replay the messages we actually received. Once
         # those are exhausted, delegate to the original receive() — only the ASGI server knows when
@@ -2121,6 +2143,16 @@ class RequireAuthForProtectedTools:
             return await receive()
 
         return await self.app(scope, replay, send)
+
+    async def _refuse_non_post(self, scope, receive, send) -> None:
+        """Challenge like a POST, else 405: the stateless transport has no GET stream or session."""
+        verdict = self._token_verdict(scope)
+        if verdict is not None:
+            return await self._challenge(scope, receive, send, invalid=(verdict == "invalid"))
+        await JSONResponse({
+            "error": "method_not_allowed",
+            "error_description": "this MCP server accepts only POST; send JSON-RPC as a POST",
+        }, status_code=405, headers={"Allow": "POST"})(scope, receive, send)
 
     def _auth_verdict(self, scope, body: bytes) -> str | None:
         """None = pass through. "missing" = no credential. "invalid" = a DEAD access token.
@@ -2153,6 +2185,10 @@ class RequireAuthForProtectedTools:
         # (initialize, tools/list, tools/call, prompts/*, resources/*) needs a credential.
         if not isinstance(method, str) or method.startswith("notifications/") or method == "ping":
             return None
+        return self._token_verdict(scope)
+
+    def _token_verdict(self, scope) -> str | None:
+        """None = a credential to pass on. "missing" = none. "invalid" = a DEAD access token."""
         token = ""
         for k, v in scope.get("headers", []):
             if k.lower() == b"authorization" and v.strip():
@@ -2167,7 +2203,7 @@ class RequireAuthForProtectedTools:
             return "invalid"
         return None             # a live access token, or a per-org token the tool validates itself
 
-    async def _challenge(self, send, *, invalid: bool = False) -> None:
+    async def _challenge(self, scope, receive, send, *, invalid: bool = False) -> None:
         from .domain.identity import mcp_oauth
 
         base = get_settings().public_url.rstrip("/")
@@ -2175,29 +2211,26 @@ class RequireAuthForProtectedTools:
         meta = f"{base}/.well-known/oauth-protected-resource{suffix}"
         # The spec SHOULDs a `scope` in the challenge so a client requests the right scopes up front,
         # least-privilege, without a second round-trip. These match scopes_supported in the metadata.
-        scope = " ".join(mcp_oauth.scopes_for_resource(self.resource_version))
+        oauth_scope = " ".join(mcp_oauth.scopes_for_resource(self.resource_version))
         if invalid:
             # RFC 6750 §3.1: the expired/invalid-token challenge. `error="invalid_token"` is the
             # machine-readable cue on which an OAuth client runs its refresh grant instead of
             # bothering the human.
             www = (f'Bearer error="invalid_token", error_description="the access token is expired or invalid", '
-                   f'scope="{scope}", resource_metadata="{meta}"')
+                   f'scope="{oauth_scope}", resource_metadata="{meta}"')
             payload = {"error": "invalid_token",
                        "error_description": ("the access token is expired or invalid — refresh the "
                                              "grant, or re-authorize at " + base + "/oauth/authorize"),
                        "resource_metadata": meta}
         else:
-            www = f'Bearer scope="{scope}", resource_metadata="{meta}"'
+            www = f'Bearer scope="{oauth_scope}", resource_metadata="{meta}"'
             payload = {"error": "unauthorized",
                        "error_description": ("this MCP server needs a treg grant — authorize at "
                                              f"{base}/oauth/authorize, or send a per-org token as a bearer"),
                        "resource_metadata": meta}
-        await send({"type": "http.response.start", "status": 401, "headers": [
-            (b"content-type", b"application/json"),
-            # The header the spec is actually about: it names where to discover how to authenticate.
-            (b"www-authenticate", www.encode()),
-        ]})
-        await send({"type": "http.response.body", "body": json.dumps(payload).encode()})
+        # The header the spec is actually about: it names where to discover how to authenticate.
+        await JSONResponse(payload, status_code=401,
+                           headers={"WWW-Authenticate": www})(scope, receive, send)
 
 
 class NoTransformResponses:
